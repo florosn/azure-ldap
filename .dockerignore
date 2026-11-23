@@ -1,0 +1,11 @@
+.git
+.gitignore
+README.md
+deploy
+*.ldif
+*.pem
+*.key
+*.crt
+*.tfstate*
+*.tfvars
+**/__pycache__

@@ -127,7 +127,7 @@ spec:
           startupProbe:
             tcpSocket:
               port: ldaps
-            failureThreshold: 60
+            failureThreshold: 360
             periodSeconds: 10
           readinessProbe:
             exec:

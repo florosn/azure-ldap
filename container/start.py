@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 
@@ -86,31 +87,48 @@ syncrepl rid={peer + 1:03}
 """
     config += "\nmirrormode TRUE\n"
     config_path = Path("/run/ldap/slapd.conf")
+    # Syncrepl needs the bind secret; this mode-0600 file lives on a memory volume.
     config_path.write_text(config)
     subprocess.run(["slaptest", "-f", str(config_path), "-u"], check=True)
     if not Path("/var/lib/ldap/data.mdb").exists():
         # Only one peer seeds the suffix; the others receive it through syncrepl.
         restore = Path("/var/lib/ldap/restore.ldif")
-        if restore.exists():
+        if restore.exists() or ordinal == 0:
+            staging = Path("/var/lib/ldap/import")
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir()
+            import_config = Path("/run/ldap/import.conf")
+            import_config.write_text(config.replace(
+                "\ndirectory /var/lib/ldap\n", "\ndirectory /var/lib/ldap/import\n"
+            ))
             try:
-                subprocess.run(
-                    ["slapadd", "-f", str(config_path), "-l", str(restore)], check=True
-                )
-            except subprocess.CalledProcessError:
-                # Never serve a partially imported directory after a restart.
-                Path("/var/lib/ldap/data.mdb").unlink(missing_ok=True)
-                Path("/var/lib/ldap/lock.mdb").unlink(missing_ok=True)
-                raise
-            restore.unlink()
-        elif ordinal == 0:
-            dc = base.split(",", 1)[0].split("=", 1)[1]
-            seed = (
-                f"dn: {base}\nobjectClass: top\nobjectClass: dcObject\n"
-                f"objectClass: organization\no: LDAP directory\ndc: {dc}\n\n"
-            )
-            subprocess.run(
-                ["slapadd", "-f", str(config_path)], input=seed, text=True, check=True
-            )
+                if restore.exists():
+                    subprocess.run(
+                        ["slapadd", "-f", str(import_config), "-l", str(restore)],
+                        check=True,
+                    )
+                else:
+                    dc = base.split(",", 1)[0].split("=", 1)[1]
+                    seed = (
+                        f"dn: {base}\nobjectClass: top\nobjectClass: dcObject\n"
+                        f"objectClass: organization\no: LDAP directory\ndc: {dc}\n\n"
+                    )
+                    subprocess.run(
+                        ["slapadd", "-f", str(import_config)],
+                        input=seed, text=True, check=True,
+                    )
+                # Publish only a fully imported MDB, even if killed during slapadd.
+                os.replace(staging / "data.mdb", "/var/lib/ldap/data.mdb")
+                directory_fd = os.open("/var/lib/ldap", os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                restore.unlink(missing_ok=True)
+            finally:
+                shutil.rmtree(staging)
+                import_config.unlink(missing_ok=True)
     os.execvp("slapd", [
         "slapd", "-f", str(config_path), "-h",
         "ldaps://0.0.0.0:1636/ ldapi://%2Frun%2Fldap%2Fldapi", "-d", "256",

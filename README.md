@@ -113,7 +113,9 @@ kubectl -n ldap get service ldap
 
 The password file must contain at least 16 characters, with **no trailing newline**.
 All peers must use the same password and CA. Protect the admin account: it also
-authenticates replication. The base DN supports `dc=` components only. Point your
+authenticates replication. OpenLDAP requires its simple-bind replication credential
+in the generated configuration; that file is mode 0600 in the memory-backed runtime
+volume, not the database disk. The base DN supports `dc=` components only. Point your
 private DNS name at the internal service IP; clients must trust the CA and use
 that DNS name, not the IP. Authenticated users can read non-password attributes;
 only the root DN `cn=admin,$LDAP_BASE_DN` can modify arbitrary entries, and users
@@ -223,8 +225,13 @@ committed blob; a running pod alone does not prove backup success.
    ```
 
    Use **empty, new PVCs**, never overlay restored data on existing MDB files.
-   Startup imports `restore.ldif` only when `data.mdb` does not exist and removes
-   the seed after successful import. Other peers obtain their seed over TLS.
+   Startup imports `restore.ldif` only when `data.mdb` does not exist, publishes
+   the completed database atomically, and removes the seed after successful import.
+   An interrupted import is rebuilt from the retained LDIF on restart; a partial
+   database is never served. Allow additional temporary disk space for the LDIF
+   and import. The startup probe allows one hour; increase its failure threshold
+   before importing a large directory if your rehearsal requires longer.
+   Other peers obtain their seed over TLS.
 4. Verify entries, password binds, writes and deletes through each peer, replication
    convergence, and new backup uploads. Only then change private DNS to the new
    internal service IP. Do not reconnect stale peers; rebuild them from the new

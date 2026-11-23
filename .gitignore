@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+__pycache__/
+*.ldif
+*.pem
+*.key
+*.crt

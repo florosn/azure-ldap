@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ldap
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ldap
+  namespace: ldap
+  annotations:
+    azure.workload.identity/client-id: "${BACKUP_CLIENT_ID}"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ldap-zonal
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ldap-headless
+  namespace: ldap
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: ldap
+  ports:
+    - name: ldaps
+      port: 1636
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ldap
+  namespace: ldap
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: ldap
+  ports:
+    - name: ldaps
+      port: 636
+      targetPort: 1636
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ldap
+  namespace: ldap
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: ldap
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ldap
+  namespace: ldap
+spec:
+  serviceName: ldap-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: ldap
+  template:
+    metadata:
+      labels:
+        app: ldap
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: ldap
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 3
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: ldap
+      containers:
+        - name: ldap
+          image: ${LDAP_IMAGE}
+          env:
+            - name: LDAP_BASE_DN
+              value: "${LDAP_BASE_DN}"
+            - name: LDAP_PEER_DOMAIN
+              value: ldap-headless.ldap.svc.cluster.local
+          ports:
+            - name: ldaps
+              containerPort: 1636
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          startupProbe:
+            tcpSocket:
+              port: ldaps
+            failureThreshold: 60
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - >-
+                  ldapsearch -LLL -H ldapi://%2Frun%2Fldap%2Fldapi -x
+                  -D "cn=admin,$LDAP_BASE_DN" -y /run/secrets/admin-password
+                  -b "$LDAP_BASE_DN" -s base dn >/dev/null
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: ldaps
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ldap
+            - name: runtime
+              mountPath: /run/ldap
+            - name: tls
+              mountPath: /run/tls
+              readOnly: true
+            - name: password
+              mountPath: /run/secrets
+              readOnly: true
+        - name: backup
+          image: ${LDAP_IMAGE}
+          command: ["python3", "/opt/ldap/backup.py"]
+          env:
+            - name: BACKUP_STORAGE_ACCOUNT
+              value: "${BACKUP_STORAGE_ACCOUNT}"
+            - name: BACKUP_INTERVAL_SECONDS
+              value: "3600"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ldap
+            - name: runtime
+              mountPath: /run/ldap
+              readOnly: true
+            - name: tls
+              mountPath: /run/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir:
+            sizeLimit: 25Gi
+        - name: tls
+          secret:
+            secretName: ldap-tls
+            defaultMode: 0440
+        - name: password
+          secret:
+            secretName: ldap-admin
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ldap-zonal
+        resources:
+          requests:
+            storage: 32Gi
